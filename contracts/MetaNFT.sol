@@ -2,27 +2,26 @@
 pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract MetaNFT is ERC721 {
-    address private _owner;
+    uint256 private _nextId = 1;
 
     constructor() ERC721("MetaNFT", "MFT") {
-        _mint(msg.sender, 1);
-        _owner = msg.sender;
     }
 
-    function mint(address to, uint256 id) external onlyOwner {
-        _safeMint(to, id);
+    function mint(address to, uint256 id) external {
+        _mint(to, id);
     }
 
-    function burn(uint256 id) external onlyOwner {
+    function mintNext(address to) external returns (uint256) {
+        _mint(to, _nextId);
+        uint256 id = _nextId;
+        _nextId++;
+        return id;
+    }
+
+    function burn(uint256 id) external {
         require(msg.sender == ownerOf(id), "not owner");
         _burn(id);
-    }
-
-    modifier onlyOwner() {
-        require(msg.sender == _owner, "not owner");
-        _;
     }
 }

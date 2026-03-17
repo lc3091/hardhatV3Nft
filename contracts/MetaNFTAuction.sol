@@ -4,18 +4,16 @@ pragma solidity 0.8.28;
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 contract MetaNFTAuction is Initializable {
     address admin;
+    mapping(address => address) public tokenToOracle;
 
     struct Auction {
-        // NFT 相关信息
-        bool end;
         IERC721 nft;
         uint256 nftId;
-        // 拍卖信息
         address payable seller;
         uint256 startingTime;
         address highestBidder;
@@ -24,16 +22,15 @@ contract MetaNFTAuction is Initializable {
         IERC20 paymentToken;
         uint256 highestBid;
         uint256 highestBidInDollar;
+        address highestBidToken;
     }
-    mapping(uint256 => mapping(address => uint256)) public bids;
-    mapping(uint256 => mapping(address => uint256)) public bidMethods; // 0第一次报价 1eth 2token
-    uint256 public auctionId;
     mapping(uint256 => Auction) public auctions;
 
     event StartBid(uint256 startingBid);
-    event Bid(address indexed sender, uint256 amount, uint256 bidMethod);
-    event Withdraw(address indexed bidder, uint256 amount);
+    event Bid(address indexed sender, uint256 amount);
     event EndBid(uint256 indexed auctionId);
+
+    uint256 public auctionId;
 
     modifier onlyAdmin() {
         require(msg.sender == admin, "not admin");
@@ -49,6 +46,11 @@ contract MetaNFTAuction is Initializable {
         admin = admin_;
     }
 
+    function setTokenOracle(address token, address oracle) external onlyAdmin {
+        require(oracle != address(0), "invalid oracle");
+        tokenToOracle[token] = oracle;
+    }
+
     // 卖家发起拍卖
     function start(
         address seller,
@@ -61,107 +63,92 @@ contract MetaNFTAuction is Initializable {
         require(nft != address(0), "invalid nft");
         require(duration >= 30, "invalid duration");
         require(paymentToken != address(0), "invalid payment token");
-        auctions[auctionId] = Auction({
-            end: false,
-            nft: IERC721(nft),
-            nftId: nftId,
-            seller: payable(seller),
-            startingTime: block.timestamp,
-            startingPriceInDollar: startingPriceInDollar * 10**8,
-            duration: duration,
-            paymentToken: IERC20(paymentToken),
-            highestBid: 0,
-            highestBidder: address(0),
-            highestBidInDollar: 0
-        });
+        Auction storage auction = auctions[auctionId];
+        auction.nft = IERC721(nft);
+        auction.nftId = nftId;
+        auction.seller = payable(seller);
+        auction.startingTime = block.timestamp;
+        auction.startingPriceInDollar = startingPriceInDollar * 10**8;
+        auction.duration = duration;
+        auction.paymentToken = IERC20(paymentToken);
+        auction.highestBid = 0;
+        auction.highestBidder = address(0);
+        auction.highestBidInDollar = 0;
+        auction.highestBidToken = address(0);
+        IERC721(nft).transferFrom(seller, address(this), nftId);
         auctionId++;
         emit StartBid(auctionId);
     }
 
     // 买家竞价
-    function bid(uint256 auctionId_) external payable {
+    function bid(uint256 auctionId_, uint256 amount) external payable {
         Auction storage auction = auctions[auctionId_];
-        uint256 allowance = auction.paymentToken.allowance(msg.sender, address(this));
-        require(msg.value > 0 || allowance > 0, "invalid bid");
-        require((msg.value > 0) != (allowance > 0), "only one of ETH or token");
         require(auction.startingTime > 0, "not started");
-        require(!auction.end, "ended");
-        require(block.timestamp < auction.startingTime + auction.duration, "ended");
-        if (auction.highestBidder != address(0)) {
-            bids[auctionId_][auction.highestBidder] += auction.highestBid;
-        }
-        uint256 bidMethod;
+        require(!isEnded(auctionId_), "ended");
         uint256 bidPrice;
-        //  判断支付方式
-        if (msg.value > 0) {
-            bidMethod = bidMethods[auctionId_][msg.sender];
-            if (bidMethod == 0) {
-                // 第一次报价 设置为eth
-                bidMethod = 1;
-                bidMethods[auctionId_][msg.sender] = bidMethod;
-            } else {
-                require(bidMethod == 1, "invalid method");
-            }
-            uint256 price = getPriceInDollar(bidMethod);
+        bool isEthBid = msg.value > 0;
+        if (isEthBid) {
+            require(amount == msg.value, "amount mismatch");
+            uint256 price = getPriceInDollar(address(0));
             bidPrice = _toUsd(msg.value, 18, price);
-            auction.highestBid = msg.value;
         } else {
-            // 设置为token
-            require(allowance > 0, "invalid payment");
-            bidMethod = bidMethods[auctionId_][msg.sender];
-            if (bidMethod == 0) {
-                bidMethod = 2;
-                bidMethods[auctionId_][msg.sender] = bidMethod;
-            } else {
-                require(bidMethod == 2, "invalid method");
-            }
-            uint256 price = getPriceInDollar(bidMethod);
+            require(amount > 0, "invalid amount");
+            uint256 price = getPriceInDollar(address(auction.paymentToken));
             uint8 tokenDecimals = IERC20Metadata(address(auction.paymentToken)).decimals();
-            bidPrice = _toUsd(allowance, tokenDecimals, price);
-            auction.highestBid = allowance;
-            IERC20(address(auction.paymentToken)).transferFrom(msg.sender, address(this), allowance);
+            bidPrice = _toUsd(amount, tokenDecimals, price);
+            IERC20(address(auction.paymentToken)).transferFrom(msg.sender, address(this), amount);
         }
         require(auction.startingPriceInDollar < bidPrice, "invalid startingPrice");
         require(auction.highestBidInDollar < bidPrice, "invalid highestBid");
+        if (auction.highestBidder != address(0) && auction.highestBidder != msg.sender) {
+            uint256 refundAmount = auction.highestBid;
+            if (refundAmount > 0) {
+                if (auction.highestBidToken == address(0)) {
+                    payable(auction.highestBidder).transfer(refundAmount);
+                } else {
+                    IERC20(address(auction.paymentToken)).transfer(auction.highestBidder, refundAmount);
+                }
+            }
+        }
+        if (isEthBid) {
+            auction.highestBid = msg.value;
+            auction.highestBidToken = address(0);
+        } else {
+            auction.highestBid = amount;
+            auction.highestBidToken = address(auction.paymentToken);
+        }
         auction.highestBidder = msg.sender;
         auction.highestBidInDollar = bidPrice;
-        emit Bid(msg.sender, msg.value, bidMethod);
+        emit Bid(msg.sender, msg.value);
     }
 
-    function withdraw(uint256 auctionId_) external returns (uint256) {
+    function isEnded(uint256 auctionId_) public view returns (bool) {
         Auction storage auction = auctions[auctionId_];
-        // 结束才能提款
-        require(block.timestamp >= auction.startingTime + auction.duration, "not ended");
-        uint256 bidMethod = bidMethods[auctionId_][msg.sender];
-        uint256 bal = bids[auctionId_][msg.sender];
-        bids[auctionId_][msg.sender] = 0;
-        if (bidMethod == 1) {
-            payable(msg.sender).transfer(bal);
-        } else {
-            IERC20(address(auction.paymentToken)).transferFrom(address(this), msg.sender, bal);
-        }
-        emit Withdraw(msg.sender, bal);
-        return bal;
+        return auction.startingTime > 0 && block.timestamp >= auction.startingTime + auction.duration;
     }
 
-    // 结束拍卖
-    function endBidding(uint256 auctionId_) external onlyAdmin{
+    function end(uint256 auctionId_) external {
+        Auction storage auction = auctions[auctionId_];
+        require(isEnded(auctionId_), "not ended");
+        require(auction.highestBidder != address(0), "no bids");
         
-        Auction storage auction = auctions[auctionId_];
-        require(!auction.end, "ended");
-        auction.end = true;
+        auction.nft.transferFrom(address(this), auction.highestBidder, auction.nftId);
+        
+        if (auction.highestBid > 0) {
+            if (auction.highestBidToken == address(0)) {
+                payable(auction.seller).transfer(auction.highestBid);
+            } else {
+                IERC20(auction.highestBidToken).transfer(auction.seller, auction.highestBid);
+            }
+        }
         emit EndBid(auctionId_);
     }
 
-    function getPriceInDollar(uint256 bidMethod) public view returns (uint256) {
+    function getPriceInDollar(address token) public view returns (uint256) {
         AggregatorV3Interface dataFeed;
-        //eth
-        if (bidMethod == 1) {
-            dataFeed = AggregatorV3Interface(0x694AA1769357215DE4FAC081bf1f309aDC325306);
-        } else {
-            // usdc
-            dataFeed = AggregatorV3Interface(0xA2F78ab2355fe2f984D808B5CeE7FD0A93D5270E);
-        }
+        address oracle = tokenToOracle[token];
+        require(oracle != address(0), "oracle not set");
+        dataFeed = AggregatorV3Interface(oracle);
         (
             /* uint80 roundId */
             ,
@@ -186,7 +173,8 @@ contract MetaNFTAuction is Initializable {
         uint256 usd = (amount * price) / scale;
         return usd;
     }
-    function getVersion() external pure returns (string memory) {
+    
+    function getVersion() external pure virtual returns (string memory) {
         return "MetaNFTAuctionV1";
     }
 }

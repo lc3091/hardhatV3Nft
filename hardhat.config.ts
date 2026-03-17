@@ -2,9 +2,10 @@ import hardhatToolboxMochaEthersPlugin from "@nomicfoundation/hardhat-toolbox-mo
 import { configVariable, defineConfig,task } from "hardhat/config";
 import HardhatIgnitionEthersPlugin from "@nomicfoundation/hardhat-ignition-ethers";
 import hardhatKeystore from "@nomicfoundation/hardhat-keystore";
+import hardhatViem from "@nomicfoundation/hardhat-viem";
 
 export default defineConfig({
-  plugins: [hardhatToolboxMochaEthersPlugin, HardhatIgnitionEthersPlugin,hardhatKeystore],
+  plugins: [hardhatToolboxMochaEthersPlugin, HardhatIgnitionEthersPlugin, hardhatKeystore, hardhatViem],
   solidity: {
     profiles: {
       default: {
